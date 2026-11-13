@@ -1,0 +1,7 @@
+fastapi[standard]
+sqlalchemy
+psycopg[binary]
+alembic
+pydantic-settings
+strawberry-graphql[fastapi]
+psycopg2-binary
