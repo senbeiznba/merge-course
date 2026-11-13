@@ -1,21 +1,20 @@
-"""REST: translating errors into the Problem Details format (RFC 9457)."""
-
 from http import HTTPStatus
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
-
+from fastapi.exceptions import RequestValidationError
 from services import ServiceError
 
 BASE = "https://example.com/problems/"
 
-# service error code -> (HTTP status, end of the type address, title)
+
 PROBLEMS = {
-    "EMAIL_TAKEN": (409, "email-taken", "Email already in use"),
-    "ALREADY_ENROLLED": (409, "already-enrolled", "Already enrolled"),
-    "COURSE_NOT_FOUND": (404, "course-not-found", "Course not found"),
-    "STUDENT_NOT_FOUND": (404, "student-not-found", "Student not found"),
+    "email-taken": (409, "email-taken", "Email Already Taken"),
+    "already-enrolled": (409, "already-enrolled", "Already Enrolled"),
+    "course-not-found": (404, "course-not-found", "Course Not Found"),
+    "student-not-found": (404, "student-not-found", "Student Not Found"),
+    "conflict": (400, "conflict", "Conflict Error"),
 }
 
 
@@ -57,7 +56,26 @@ def install(app: FastAPI) -> None:
             detail=exc.message,
             type=BASE + end_type,
         )
-
+    @app.exception_handler(RequestValidationError)
+    async def on_validation_error(request: Request, exc: RequestValidationError):
+        errors = [
+            {
+                "in": err["loc"][0],
+                "field": ".".join(str(part) for part in err["loc"][1:]),
+                "detail": err["msg"],
+            }
+            for err in exc.errors()
+        ]
+        text = f"{len(errors)} invalid value(s) in the request"
+        return problem(
+            request,
+            422,
+            "Validation failed",
+            text,
+            type=BASE + "validation-error",
+            errors=errors,
+        )
+    
     @app.exception_handler(StarletteHTTPException)
     async def on_http_error(request: Request, exc: StarletteHTTPException):
         status = exc.status_code

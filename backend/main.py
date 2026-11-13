@@ -2,12 +2,13 @@ import os
 import problem
 import services
 import models
+import counter
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from strawberry.fastapi import GraphQLRouter
-from graphql_api import schema
+from graphql_api import schema, get_context
 
 from db import get_db, Base, engine
 from models import Course, Enrollment, Student
@@ -24,6 +25,7 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Course Catalog API")
 problem.install(app)
+counter.install(app)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,8 +34,8 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
-# Подключаем GraphQL роутер
-graphql_app = GraphQLRouter(schema)
+# Подключаем GraphQL роутер с передачей контекста сессии БД
+graphql_app = GraphQLRouter(schema, context_getter=get_context)
 app.include_router(graphql_app, prefix="/graphql")
 
 # Зависимость для получения сессии базы данных в эндпоинтах
@@ -97,13 +99,40 @@ def create_student(data: StudentIn, db: Session = SessionDep):
     return services.create_student(db, data.name, data.email)
 
 
+@app.get("/students/{student_id}", response_model=StudentOut)
+def get_student(student_id: int, db: Session = SessionDep):
+    student = db.get(Student, student_id)
+    if student is None:
+        raise services.ServiceError("STUDENT_NOT_FOUND", "Student not found")
+    return student
+
+
 @app.post("/enrollments", response_model=EnrollmentOut, status_code=201)
 def create_enrollment(data: EnrollmentIn, db: Session = SessionDep):
     return services.enroll(db, data.course_id, data.student_id)
 
 
-@app.get("/enrollments", response_model=list[EnrollmentOut])
-def list_enrollments(db: Session = SessionDep):
+def enrollment_details():
     from sqlalchemy import select
-    stmt = select(Enrollment).order_by(Enrollment.id)
-    return db.scalars(stmt).all()
+    return select(
+        Enrollment.id,
+        Enrollment.course_id,
+        Enrollment.student_id,
+        Enrollment.enrolled_at,
+        Course.title.label("courseTitle"),
+        Student.name.label("studentName"),
+    ).join(Course).join(Student).order_by(Enrollment.id)
+
+
+@app.get("/enrollments")
+def list_enrollments(db: Session = SessionDep):
+    return db.execute(enrollment_details()).all()
+
+
+@app.get("/students/{student_id}/enrollments")
+def list_student_enrollments(student_id: int, db: Session = SessionDep):
+    student = db.get(Student, student_id)
+    if student is None:
+        raise services.ServiceError("STUDENT_NOT_FOUND", "Student not found")
+    stmt = enrollment_details().where(Enrollment.student_id == student_id)
+    return db.execute(stmt).all()

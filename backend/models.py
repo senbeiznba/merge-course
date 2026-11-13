@@ -1,4 +1,3 @@
-"""SQLAlchemy database models."""
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy import Boolean, Column, ForeignKey, Integer, String
 from db import Base

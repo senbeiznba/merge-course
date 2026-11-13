@@ -1,150 +1,186 @@
-"""GraphQL API using Strawberry."""
+from collections import defaultdict
+from datetime import datetime
+from typing import Annotated, Optional
 
 import strawberry
+from fastapi import Depends
+from sqlalchemy import select
 from sqlalchemy.orm import Session
-from db import SessionLocal
+from strawberry.dataloader import DataLoader
+from strawberry.fastapi import BaseContext, GraphQLRouter
+from strawberry.types import Info
+
+from db import get_db
 from models import (
     Course as CourseModel,
-    Student as StudentModel,
     Enrollment as EnrollmentModel,
+    Student as StudentModel,
 )
 
-@strawberry.type
-class Course:
-    id: str
+
+def batch_loader(db: Session, column, many: bool = False) -> DataLoader:
+    """Gathers keys in one pass and loads all rows with a single IN (...) query."""
+    model = column.class_
+
+    async def load(keys: list) -> list:
+        rows = db.scalars(select(model).where(column.in_(keys))).all()
+        groups = defaultdict(list)
+        for row in rows:
+            groups[getattr(row, column.key)].append(row)
+        if many:
+            return [groups[key] for key in keys]
+        return [groups[key][0] if groups[key] else None for key in keys]
+
+    return DataLoader(load_fn=load)
+
+
+class Context(BaseContext):
+    """Created per request: the session and loaders don't outlive the request."""
+
+    def __init__(self, db: Session):
+        super().__init__()
+        self.db = db
+        self.course = batch_loader(db, CourseModel.id)
+        self.student = batch_loader(db, StudentModel.id)
+        self.enrollments_of_course = batch_loader(db, EnrollmentModel.course_id, many=True)
+        self.enrollments_of_student = batch_loader(db, EnrollmentModel.student_id, many=True)
+
+
+def get_context(db: Annotated[Session, Depends(get_db)]) -> Context:
+    return Context(db)
+
+
+@strawberry.type(name="Course")
+class CourseType:
+    id: strawberry.ID
     title: str
     description: str
     credits: int
-    likes: int
     is_elective: bool
+    likes: int
+    level: str
 
-    @classmethod
-    def from_model(cls, m: CourseModel) -> "Course":
-        return cls(
-            id=m.id,
-            title=m.title,
-            description=m.description,
-            credits=m.credits,
-            likes=m.likes,
-            is_elective=m.is_elective,
-        )
+    @strawberry.field
+    async def enrollments(self, info: Info[Context, None]) -> list["EnrollmentType"]:
+        return await info.context.enrollments_of_course.load(self.id)
 
-@strawberry.type
-class Student:
-    id: int
+
+@strawberry.type(name="Student")
+class StudentType:
+    id: strawberry.ID
     name: str
     email: str
 
-    @classmethod
-    def from_model(cls, m: StudentModel) -> "Student":
-        return cls(
-            id=m.id,
-            name=m.name,
-            email=m.email,
-        )
+    @strawberry.field
+    async def enrollments(self, info: Info[Context, None]) -> list["EnrollmentType"]:
+        return await info.context.enrollments_of_student.load(int(self.id))
+
+
+@strawberry.type(name="Enrollment")
+class EnrollmentType:
+    id: strawberry.ID
+    enrolled_at: datetime
+    course_id: strawberry.Private[str]
+    student_id: strawberry.Private[int]
+
+    @strawberry.field
+    async def course(self, info: Info[Context, None]) -> CourseType:
+        return await info.context.course.load(self.course_id)
+
+    @strawberry.field
+    async def student(self, info: Info[Context, None]) -> StudentType:
+        return await info.context.student.load(self.student_id)
+
 
 @strawberry.type
-class Enrollment:
-    id: int
-    student_id: int
-    course_id: str
+class UserError:
+    code: str
+    message: str
 
-    @classmethod
-    def from_model(cls, m: EnrollmentModel) -> "Enrollment":
-        return cls(
-            id=m.id,
-            student_id=m.student_id,
-            course_id=m.course_id,
-        )
+
+@strawberry.input
+class EnrollInput:
+    course_id: strawberry.ID
+    student_id: strawberry.ID
+
+
+@strawberry.type
+class EnrollPayload:
+    enrollment: EnrollmentType | None = None
+    user_errors: list[UserError] = strawberry.field(default_factory=list)
+
+
+@strawberry.type
+class LikePayload:
+    course: CourseType | None = None
+    user_errors: list[UserError] = strawberry.field(default_factory=list)
+
+
+def as_user_errors(err) -> list[UserError]:
+    return [UserError(code=err.code, message=err.message)]
+
 
 @strawberry.type
 class Query:
     @strawberry.field
-    def courses(self, is_elective: bool | None = None, sort: str = "popular") -> list[Course]:
-        db: Session = SessionLocal()
-        try:
-            from sqlalchemy import select
-            stmt = select(CourseModel)
-            if is_elective is not None:
-                stmt = stmt.where(CourseModel.is_elective == is_elective)
-            
-            if sort == "title":
-                stmt = stmt.order_by(CourseModel.title)
-            else:
-                stmt = stmt.order_by(CourseModel.likes.desc(), CourseModel.id)
-                
-            models = db.scalars(stmt).all()
-            return [Course.from_model(m) for m in models]
-        finally:
-            db.close()
+    def courses(
+        self, info: Info[Context, None], is_elective: bool | None = None, limit: int = 20
+    ) -> list[CourseType]:
+        db = info.context.db
+        stmt = select(CourseModel).order_by(CourseModel.likes.desc(), CourseModel.id).limit(limit)
+        if is_elective is not None:
+            stmt = stmt.where(CourseModel.is_elective == is_elective)
+        return db.scalars(stmt).all()
 
     @strawberry.field
-    def students(self) -> list[Student]:
-        db: Session = SessionLocal()
-        try:
-            from sqlalchemy import select
-            stmt = select(StudentModel)
-            models = db.scalars(stmt).all()
-            return [Student.from_model(m) for m in models]
-        finally:
-            db.close()
+    def course(self, info: Info[Context, None], id: strawberry.ID) -> CourseType | None:
+        db = info.context.db
+        return db.get(CourseModel, id)
 
     @strawberry.field
-    def enrollments(self) -> list[Enrollment]:
-        db: Session = SessionLocal()
-        try:
-            from sqlalchemy import select
-            stmt = select(EnrollmentModel)
-            models = db.scalars(stmt).all()
-            return [Enrollment.from_model(m) for m in models]
-        finally:
-            db.close()
+    def students(self, info: Info[Context, None], limit: int = 20) -> list[StudentType]:
+        db = info.context.db
+        stmt = select(StudentModel).order_by(StudentModel.id).limit(limit)
+        return db.scalars(stmt).all()
+
+    @strawberry.field
+    def student(self, info: Info[Context, None], id: strawberry.ID) -> StudentType | None:
+        db = info.context.db
+        return db.get(StudentModel, int(id))
+
+    @strawberry.field
+    def enrollments(self, info: Info[Context, None], limit: int = 20) -> list[EnrollmentType]:
+        db = info.context.db
+        stmt = select(EnrollmentModel).order_by(EnrollmentModel.id).limit(limit)
+        return db.scalars(stmt).all()
+
 
 @strawberry.type
 class Mutation:
     @strawberry.mutation
-    def add_student(self, name: str, email: str) -> Student:
-        db: Session = SessionLocal()
+    def enroll(self, info: Info[Context, None], input: EnrollInput) -> EnrollPayload:
+        db = info.context.db
         try:
-            db_student = StudentModel(name=name, email=email)
-            db.add(db_student)
-            db.commit()
-            db.refresh(db_student)
-            return Student.from_model(db_student)
-        finally:
-            db.close()
+            import services
+            enrollment = services.enroll(db, input.course_id, int(input.student_id))
+            return EnrollPayload(enrollment=enrollment)
+        except Exception as err:
+            if hasattr(err, "code") and hasattr(err, "message"):
+                return EnrollPayload(user_errors=as_user_errors(err))
+            raise err
 
     @strawberry.mutation
-    def add_course(
-        self, id: str, title: str, description: str, credits: int, is_elective: bool = False
-    ) -> Course:
-        db: Session = SessionLocal()
+    def like_course(self, info: Info[Context, None], id: strawberry.ID) -> LikePayload:
+        db = info.context.db
         try:
-            db_course = CourseModel(
-                id=id,
-                title=title,
-                description=description,
-                credits=credits,
-                likes=0,
-                is_elective=is_elective
-            )
-            db.add(db_course)
-            db.commit()
-            db.refresh(db_course)
-            return Course.from_model(db_course)
-        finally:
-            db.close()
+            import services
+            course = services.like_course(db, id)
+            return LikePayload(course=course)
+        except Exception as err:
+            if hasattr(err, "code") and hasattr(err, "message"):
+                return LikePayload(user_errors=as_user_errors(err))
+            raise err
 
-    @strawberry.mutation
-    def enroll_student(self, student_id: int, course_id: str) -> Enrollment:
-        db: Session = SessionLocal()
-        try:
-            db_enrollment = EnrollmentModel(student_id=student_id, course_id=course_id)
-            db.add(db_enrollment)
-            db.commit()
-            db.refresh(db_enrollment)
-            return Enrollment.from_model(db_enrollment)
-        finally:
-            db.close()
 
 schema = strawberry.Schema(query=Query, mutation=Mutation)
+graphql_app = GraphQLRouter(schema, context_getter=get_context)

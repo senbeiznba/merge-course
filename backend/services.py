@@ -1,12 +1,9 @@
-"""Services layer: application rules without HTTP and without GraphQL."""
-
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from models import Course, Enrollment, Student
 
-# Constraint name -> (code, message). Names come from naming_convention in db.py.
 CONSTRAINT_ERRORS = {
     "students_email_key": ("EMAIL_TAKEN", "Student with this email already exists"),
     "enrollments_course_id_student_id_key": ("ALREADY_ENROLLED", "Student is already enrolled in this course"),
@@ -37,16 +34,32 @@ def commit(db: Session) -> None:
 
 
 def create_student(db: Session, name: str, email: str) -> Student:
+    # Бонусное правило для проверки имени
+    if len(name.strip()) < 2:
+        raise ServiceError("INVALID_NAME", "Name must have at least 2 characters")
+        
     student = Student(name=name, email=email)
     db.add(student)
     commit(db)
+    db.refresh(student)
     return student
 
 
 def enroll(db: Session, course_id: str, student_id: int) -> Enrollment:
+    # Проверяем существование курса и студента перед добавлением, 
+    # чтобы поймать внешние ключи или выдать корректную ошибку через ServiceError
+    course = db.get(Course, course_id)
+    if not course:
+        raise ServiceError("COURSE_NOT_FOUND", "Course not found")
+
+    student = db.get(Student, student_id)
+    if not student:
+        raise ServiceError("STUDENT_NOT_FOUND", "Student not found")
+
     enrollment = Enrollment(course_id=course_id, student_id=student_id)
     db.add(enrollment)
     commit(db)
+    db.refresh(enrollment)
     return enrollment
 
 
@@ -61,4 +74,5 @@ def like_course(db: Session, course_id: str) -> Course:
     if course is None:
         raise ServiceError("COURSE_NOT_FOUND", "Course not found")
     commit(db)
+    db.refresh(course)
     return course
